@@ -2,5 +2,6 @@
 numpy
 openpyxl
 plotly
+reportlab
 streamlit
 pytest

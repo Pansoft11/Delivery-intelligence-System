@@ -1,11 +1,18 @@
 ﻿from __future__ import annotations
 
+import smtplib
+from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from src.data_processing import (
     ProcessedData,
@@ -137,6 +144,117 @@ def workbook_template_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def report_excel_bytes(kpi_summary_df: pd.DataFrame, operational_summary_df: pd.DataFrame) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        kpi_summary_df.to_excel(writer, sheet_name="KPI Summary", index=False)
+        operational_summary_df.to_excel(writer, sheet_name="Operational Snapshot", index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def build_pdf_table(frame: pd.DataFrame) -> Table:
+    table_data = [list(frame.columns)] + frame.astype(str).values.tolist()
+    table = Table(table_data, repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f766e")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f4ec")]),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    return table
+
+
+def report_pdf_bytes(
+    source_name: str,
+    kpi_summary_df: pd.DataFrame,
+    operational_summary_df: pd.DataFrame,
+    project_snapshot_df: pd.DataFrame,
+) -> bytes:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=32,
+        rightMargin=32,
+        topMargin=32,
+        bottomMargin=32,
+    )
+    styles = getSampleStyleSheet()
+    story: list[Any] = [
+        Paragraph("PANSOFT Delivery Intelligence Report", styles["Title"]),
+        Spacer(1, 8),
+        Paragraph(f"Data source: {source_name}", styles["Normal"]),
+        Spacer(1, 14),
+        Paragraph("KPI Summary", styles["Heading2"]),
+        build_pdf_table(kpi_summary_df),
+        Spacer(1, 12),
+        Paragraph("Operational Snapshot", styles["Heading2"]),
+        build_pdf_table(operational_summary_df),
+        Spacer(1, 12),
+        Paragraph("Project Health Snapshot", styles["Heading2"]),
+        build_pdf_table(project_snapshot_df),
+    ]
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def smtp_settings() -> dict[str, Any] | None:
+    if "smtp" not in st.secrets:
+        return None
+    smtp_config = dict(st.secrets["smtp"])
+    required_fields = {"host", "port", "username", "password", "from_email"}
+    if not required_fields.issubset(smtp_config):
+        return None
+    smtp_config["use_tls"] = bool(smtp_config.get("use_tls", True))
+    return smtp_config
+
+
+def send_report_email(
+    smtp_config: dict[str, Any],
+    recipients: list[str],
+    subject: str,
+    body: str,
+    summary_excel: bytes,
+    summary_pdf: bytes,
+) -> None:
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = smtp_config["from_email"]
+    message["To"] = ", ".join(recipients)
+    message.set_content(body)
+    message.add_attachment(
+        summary_excel,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="dashboard_summary.xlsx",
+    )
+    message.add_attachment(
+        summary_pdf,
+        maintype="application",
+        subtype="pdf",
+        filename="dashboard_report.pdf",
+    )
+
+    with smtplib.SMTP(smtp_config["host"], int(smtp_config["port"])) as server:
+        if smtp_config.get("use_tls", True):
+            server.starttls()
+        server.login(smtp_config["username"], smtp_config["password"])
+        server.send_message(message)
+
+
 st.markdown(
     """
     <style>
@@ -258,6 +376,101 @@ power_bi_dataset = dashboard["power_bi_dataset"]
 avg_utilization = utilization["utilization_pct"].mean()
 top_engineer = utilization.iloc[0]
 top_capability = capability.iloc[0]
+project_snapshot_df = project_kpis[
+    ["project_name", "rft", "otd", "feedback_score", "project_health"]
+].rename(
+    columns={
+        "project_name": "Project",
+        "rft": "RFT",
+        "otd": "OTD",
+        "feedback_score": "Feedback",
+        "project_health": "Health",
+    }
+)
+operational_summary_df = pd.DataFrame(
+    {
+        "Metric": [
+            "Top Utilization",
+            "Top Capability",
+            "Projects Tracked",
+            "Engineers Tracked",
+            "Data Source",
+        ],
+        "Value": [
+            f"{top_engineer['engineer']} ({top_engineer['utilization_pct']:.1f}%)",
+            f"{top_capability['engineer']} ({top_capability['capability_score']:.2f})",
+            project_kpis["project_id"].nunique(),
+            utilization["engineer"].nunique(),
+            source_label,
+        ],
+    }
+)
+kpi_summary_export_df = dashboard["kpi_summary"].copy()
+summary_excel = report_excel_bytes(kpi_summary_export_df, operational_summary_df)
+summary_pdf = report_pdf_bytes(
+    source_label,
+    kpi_summary_export_df,
+    operational_summary_df,
+    project_snapshot_df,
+)
+mail_settings = smtp_settings()
+
+action_cols = st.columns([1.2, 1.2, 1.6])
+with action_cols[0]:
+    st.download_button(
+        "Download Summary Table",
+        data=summary_excel,
+        file_name="dashboard_summary.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+with action_cols[1]:
+    st.download_button(
+        "Download PDF Report",
+        data=summary_pdf,
+        file_name="dashboard_report.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+with action_cols[2]:
+    with st.popover("Send Report to Mail"):
+        st.caption("Sends the summary workbook and PDF report as email attachments.")
+        recipients_raw = st.text_input(
+            "Recipients",
+            placeholder="manager@company.com, team@company.com",
+            help="Separate multiple email addresses with commas.",
+        )
+        mail_subject = st.text_input(
+            "Subject",
+            value="PANSOFT Delivery Intelligence Report",
+        )
+        mail_body = st.text_area(
+            "Email body",
+            value="Please find attached the latest dashboard summary table and PDF report.",
+            height=120,
+        )
+        if mail_settings is None:
+            st.info(
+                "Email sending is not configured yet. Add SMTP credentials in Streamlit secrets to enable this button."
+            )
+        if st.button("Send Report", use_container_width=True, disabled=mail_settings is None):
+            recipients = [email.strip() for email in recipients_raw.split(",") if email.strip()]
+            if not recipients:
+                st.error("Enter at least one recipient email address.")
+            else:
+                try:
+                    send_report_email(
+                        smtp_config=mail_settings,
+                        recipients=recipients,
+                        subject=mail_subject,
+                        body=mail_body,
+                        summary_excel=summary_excel,
+                        summary_pdf=summary_pdf,
+                    )
+                except Exception as exc:
+                    st.error(f"Email send failed: {exc}")
+                else:
+                    st.success("Report email sent successfully.")
 
 metric_cols = st.columns(4)
 metric_specs = [
@@ -382,46 +595,12 @@ with bottom_right:
     snapshot_cols = st.columns(2)
     with snapshot_cols[0]:
         st.dataframe(
-            project_kpis[
-                [
-                    "project_name",
-                    "rft",
-                    "otd",
-                    "feedback_score",
-                    "project_health",
-                ]
-            ].rename(
-                columns={
-                    "project_name": "Project",
-                    "rft": "RFT",
-                    "otd": "OTD",
-                    "feedback_score": "Feedback",
-                    "project_health": "Health",
-                }
-            ),
+            project_snapshot_df,
             use_container_width=True,
             hide_index=True,
         )
     with snapshot_cols[1]:
-        summary_df = pd.DataFrame(
-            {
-                "Metric": [
-                    "Top Utilization",
-                    "Top Capability",
-                    "Projects Tracked",
-                    "Engineers Tracked",
-                    "Data Source",
-                ],
-                "Value": [
-                    f"{top_engineer['engineer']} ({top_engineer['utilization_pct']:.1f}%)",
-                    f"{top_capability['engineer']} ({top_capability['capability_score']:.2f})",
-                    project_kpis["project_id"].nunique(),
-                    utilization["engineer"].nunique(),
-                    source_label,
-                ],
-            }
-        )
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(operational_summary_df, use_container_width=True, hide_index=True)
 
 st.markdown('<div class="section-title">Data Health</div>', unsafe_allow_html=True)
 health_cols = st.columns(3)

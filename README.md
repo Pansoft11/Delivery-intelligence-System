@@ -6,9 +6,10 @@ This repository contains a Python analytics pipeline and a Streamlit dashboard f
 
 - `app.py` is the Streamlit entrypoint for deployment.
 - `main.py` runs the offline reporting pipeline and exports Excel outputs.
-- `requirements.txt` now includes the packages needed by Streamlit Community Cloud.
+- `requirements.txt` includes the packages needed by Streamlit Community Cloud.
 - `.gitignore` excludes local caches, generated outputs, and secrets.
 - `.streamlit/config.toml` provides a stable light theme for deployment.
+- The dashboard can export a summary workbook, generate a PDF report, and email both attachments when SMTP secrets are configured.
 
 ## Run locally
 
@@ -36,6 +37,28 @@ The dashboard accepts one Excel workbook with these required sheets:
 
 If you do not upload a workbook, the app uses `data/master_data.xlsx` when present, otherwise it falls back to built-in sample data.
 
+## Email setup for Streamlit
+
+To enable `Send Report to Mail`, add SMTP secrets in the Streamlit app settings.
+
+Use this format in Streamlit Secrets:
+
+```toml
+[smtp]
+host = "smtp.gmail.com"
+port = 587
+username = "your-email@company.com"
+password = "your-app-password"
+from_email = "your-email@company.com"
+use_tls = true
+```
+
+Notes:
+
+- For Gmail, use an app password instead of your normal password.
+- The app attaches `dashboard_summary.xlsx` and `dashboard_report.pdf` to the email.
+- Without these secrets, the mail popover stays visible but the send action is disabled.
+
 ## Push to GitHub
 
 Run these commands from the project folder after creating an empty GitHub repository:
@@ -56,6 +79,7 @@ git push -u origin main
 3. Click `Create app`.
 4. Select your repository, branch `main`, and file path `app.py`.
 5. Click `Deploy`.
+6. If you want email sending, open the deployed app settings and add the SMTP secrets above.
 
 ## Recommended repo contents
 
